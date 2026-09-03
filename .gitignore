@@ -1,0 +1,17 @@
+.env
+*.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+instance/
+.webassets-cache
+app/uploads/*
+!app/uploads/.gitkeep
+.vscode/
+.idea/
+.DS_Store
+*.log
+app/local.db

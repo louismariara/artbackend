@@ -1,8 +1,8 @@
-"""Using Postgres
+"""initial schema
 
-Revision ID: 055998f5247a
+Revision ID: 62307a93f67d
 Revises: 
-Create Date: 2025-02-03 14:45:47.690888
+Create Date: 2026-09-02 10:44:57.406776
 
 """
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '055998f5247a'
+revision = '62307a93f67d'
 down_revision = None
 branch_labels = None
 depends_on = None
@@ -46,6 +46,8 @@ def upgrade():
     sa.Column('views', sa.Integer(), nullable=True),
     sa.Column('updated_at', sa.DateTime(), nullable=True),
     sa.Column('member_id', sa.Integer(), nullable=True),
+    sa.Column('image_path', sa.String(length=255), nullable=True),
+    sa.Column('description', sa.Text(), nullable=True),
     sa.ForeignKeyConstraint(['member_id'], ['member.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
