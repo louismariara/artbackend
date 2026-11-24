@@ -1,7 +1,7 @@
 from flask import Blueprint, jsonify, request, g
 from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt, get_jwt_identity
 import hashlib
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta, date
 import bcrypt
 import re
 import secrets
@@ -10,14 +10,37 @@ from ..models.super_admin import SuperAdmin
 from ..models.super_admin_session import SuperAdminSession
 from ..models.organization import Organization
 from ..models.member import Member
+from ..models.role import Role
 from ..models.artwork import Artwork
 from ..utils.logging import logger
 from ..utils.decorators import super_admin_required
-from ..utils.helpers import RESERVED_SUBDOMAINS, is_valid_slug, normalize_slug, SLUG_RULES_MESSAGE, build_reset_link
-from ..utils.email import send_password_reset_email
+from ..utils.helpers import RESERVED_SUBDOMAINS, apply_lease, is_valid_slug, normalize_slug, SLUG_RULES_MESSAGE, build_reset_link
+from ..utils.email import send_password_reset_email, send_lease_reminder_email
 from ..utils.notify import notify_all_admins
 
 platform_admin_bp = Blueprint('platform_admin', __name__, url_prefix='/platform-admin')
+
+LEASE_NOTICE_DAYS = 14
+
+
+def _lease_view(org):
+    """How the platform should describe a gallery's paid period.
+    unset: nobody has recorded a payment yet.
+    current: more than two weeks left.
+    expiring: two weeks or less.
+    expired: the paid-through date has passed."""
+    today = date.today()
+    paid = org.paid_until
+    if paid is None:
+        return {"paid_until": None, "lease_state": "unset", "days_left": None}
+    days_left = (paid - today).days
+    if days_left < 0:
+        state = "expired"
+    elif days_left <= LEASE_NOTICE_DAYS:
+        state = "expiring"
+    else:
+        state = "current"
+    return {"paid_until": paid.isoformat(), "lease_state": state, "days_left": days_left}
 
 
 def _issue_super_admin_tokens(super_admin):
@@ -113,6 +136,7 @@ def list_galleries():
         orgs = Organization.query.order_by(Organization.created_at.desc()).all()
         galleries = []
         for org in orgs:
+            apply_lease(org)
             galleries.append({
                 "id": org.id,
                 "name": org.name,
@@ -121,6 +145,7 @@ def list_galleries():
                 "created_at": org.created_at.isoformat(),
                 "member_count": Member.query.filter_by(organization_id=org.id).count(),
                 "artwork_count": Artwork.query.filter_by(organization_id=org.id).count(),
+                **_lease_view(org),
             })
         return jsonify({"galleries": galleries}), 200
     except Exception as e:
@@ -137,6 +162,7 @@ def suspend_gallery(org_id):
             return jsonify({"message": "Gallery is already suspended"}), 400
 
         org.status = 'suspended'
+        org.suspended_reason = 'manual'
         db.session.commit()
         logger.info(f"Gallery '{org.name}' (id={org.id}) suspended by super admin {g.current_super_admin.email}")
         return jsonify({"message": f"'{org.name}' has been suspended", "gallery": {"id": org.id, "status": org.status}}), 200
@@ -155,8 +181,13 @@ def reactivate_gallery(org_id):
             return jsonify({"message": "Gallery not found"}), 404
         if org.status == 'active':
             return jsonify({"message": "Gallery is already active"}), 400
+        if org.paid_until is not None and org.paid_until < date.today():
+            return jsonify({
+                "message": "This gallery's paid period has ended. Set a new paid-through date before reactivating it."
+            }), 400
 
         org.status = 'active'
+        org.suspended_reason = None
         db.session.commit()
         logger.info(f"Gallery '{org.name}' (id={org.id}) reactivated by super admin {g.current_super_admin.email}")
         return jsonify({"message": f"'{org.name}' has been reactivated", "gallery": {"id": org.id, "status": org.status}}), 200
@@ -208,7 +239,7 @@ def update_gallery(org_id):
         logger.info(f"Gallery id={org.id} updated by super admin {g.current_super_admin.email}: name '{old_name}' -> '{org.name}', slug '{old_slug}' -> '{org.slug}'")
         return jsonify({
             "message": "Gallery updated",
-            "gallery": {"id": org.id, "name": org.name, "slug": org.slug, "status": org.status}
+            "gallery": {"id": org.id, "name": org.name, "slug": org.slug, "status": org.status, **_lease_view(org)}
         }), 200
     except Exception as e:
         db.session.rollback()
@@ -227,7 +258,7 @@ def view_gallery_members(org_id):
         now = datetime.now()
         members = Member.query.filter_by(organization_id=org.id).order_by(Member.id).all()
         return jsonify({
-            "gallery": {"id": org.id, "name": org.name, "slug": org.slug, "status": org.status},
+            "gallery": {"id": org.id, "name": org.name, "slug": org.slug, "status": org.status, "currency": org.currency, **_lease_view(org)},
             "members": [{
                 "id": m.id,
                 "name": m.name,
@@ -253,7 +284,7 @@ def view_gallery_artworks(org_id):
 
         artworks = Artwork.query.filter_by(organization_id=org.id).order_by(Artwork.id).all()
         return jsonify({
-            "gallery": {"id": org.id, "name": org.name, "slug": org.slug, "status": org.status},
+            "gallery": {"id": org.id, "name": org.name, "slug": org.slug, "status": org.status, "currency": org.currency},
             "artworks": [{
                 "id": a.id,
                 "title": a.title,
@@ -267,6 +298,94 @@ def view_gallery_artworks(org_id):
     except Exception as e:
         logger.error(f"Error viewing artworks of gallery {org_id}: {str(e)}")
         return jsonify({"message": "An error occurred"}), 500
+@platform_admin_bp.route("/galleries/<int:org_id>/lease", methods=["PATCH"])
+@super_admin_required
+def set_gallery_lease(org_id):
+    """Record how long this gallery has paid for. There is no payment
+    provider yet, so a super admin types the paid-through date by hand.
+    Send paid_until as YYYY-MM-DD, or null to clear it."""
+    data = request.get_json(silent=True)
+    if data is None or 'paid_until' not in data:
+        return jsonify({"message": "Provide paid_until as YYYY-MM-DD, or null to clear it"}), 400
+
+    raw = data.get('paid_until')
+    try:
+        org = Organization.query.get(org_id)
+        if not org:
+            return jsonify({"message": "Gallery not found"}), 404
+        if raw in (None, ''):
+            org.paid_until = None
+        else:
+            if not isinstance(raw, str):
+                return jsonify({"message": "paid_until must be a date like 2026-12-31"}), 400
+            org.paid_until = date.fromisoformat(raw)
+        db.session.commit()
+        apply_lease(org)
+        logger.info(f"Gallery '{org.name}' paid_until set to {org.paid_until} by {g.current_super_admin.email}")
+        return jsonify({
+            "message": "Lease updated",
+            "gallery": {"id": org.id, "name": org.name, "status": org.status, **_lease_view(org)}
+        }), 200
+    except ValueError:
+        return jsonify({"message": "paid_until must be a date like 2026-12-31"}), 400
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error setting lease for gallery {org_id}: {str(e)}")
+        return jsonify({"message": "An error occurred"}), 500
+
+
+@platform_admin_bp.route("/galleries/<int:org_id>/lease-reminder", methods=["POST"])
+@super_admin_required
+def remind_gallery_lease(org_id):
+    """Tell the gallery's own admins that the lease needs a payment.
+    Always leaves an in-app notice. Also emails them when SendGrid is configured."""
+    try:
+        org = Organization.query.get(org_id)
+        if not org:
+            return jsonify({"message": "Gallery not found"}), 404
+
+        admins = (Member.query
+                  .join(Role, Member.role_id == Role.id)
+                  .filter(Member.organization_id == org.id, Role.name == 'admin')
+                  .all())
+        if not admins:
+            return jsonify({"message": "This gallery has no admin to remind"}), 400
+
+        when = org.paid_until.isoformat() if org.paid_until else "not recorded"
+        notice = f"The lease for {org.name} is paid through {when}. Please arrange the next payment."
+        notify_all_admins(notice, org.id)
+
+        emailed = []
+        failed = []
+        for admin in admins:
+            if send_lease_reminder_email(admin.email, org.name, org.paid_until):
+                emailed.append(admin.email)
+            else:
+                failed.append(admin.email)
+
+        logger.info(f"Lease reminder for '{org.name}' by {g.current_super_admin.email}: emailed {emailed}, failed {failed}")
+        if failed and not emailed:
+            return jsonify({
+                "message": "The gallery admin was notified in the app. The email could not be sent. Check SENDGRID_API_KEY and SENDGRID_FROM_EMAIL.",
+                "emailed": emailed,
+                "failed": failed,
+            }), 200
+        if failed:
+            return jsonify({
+                "message": f"Reminder emailed to {', '.join(emailed)}. Could not email {', '.join(failed)}.",
+                "emailed": emailed,
+                "failed": failed,
+            }), 200
+        return jsonify({
+            "message": f"Reminder emailed to {', '.join(emailed)}, and left in their notifications.",
+            "emailed": emailed,
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Error sending lease reminder for gallery {org_id}: {str(e)}")
+        return jsonify({"message": "An error occurred"}), 500
+
+
 def _get_gallery_member(org_id, member_id):
     """Looks the member up inside the gallery named in the URL, so an id that
     belongs to a different gallery can never be touched by mistake."""

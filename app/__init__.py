@@ -22,6 +22,7 @@ from .extensions import limiter
 from .routes.notification import notification_bp
 from .routes.platform_admin import platform_admin_bp
 from .routes.gallery import gallery_bp
+from .routes.gallery_settings import gallery_settings_bp
 import os
 import click
 import bcrypt
@@ -107,6 +108,7 @@ def create_app():
     app.register_blueprint(notification_bp)
     app.register_blueprint(platform_admin_bp)
     app.register_blueprint(gallery_bp)
+    app.register_blueprint(gallery_settings_bp)
     
     # Seed default roles via `flask init-roles` (run once, after `flask db upgrade`).
     # This is NOT called automatically here — doing so broke `flask db migrate`

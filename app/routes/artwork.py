@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from flask import Blueprint, jsonify, request
 from ..extensions import db
 from ..models.artwork import Artwork
@@ -25,6 +26,20 @@ artworks_schema = ArtworkSchema(many=True)
 def _get_current_member():
     current_user_id = get_jwt_identity()
     return Member.query.get(int(current_user_id))
+
+
+def _clean_price(value):
+    """None means the piece has no listed price. Anything else must be a
+    non-negative amount with at most two decimal places."""
+    if value in (None, ''):
+        return None
+    try:
+        price = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return 'invalid'
+    if not price.is_finite() or price < 0 or price.copy_abs() >= Decimal('100000000'):
+        return 'invalid'
+    return price.quantize(Decimal('0.01'))
 def _delete_limit_key():
     current_user_id = get_jwt_identity()
     return str(current_user_id)
@@ -102,6 +117,10 @@ def create_artwork():
         if not is_valid_image_path(data.get('image_path'), member.organization_id):
             return jsonify({"message": "Invalid image_path. Upload the image first and use the filename it returns."}), 400
 
+        price = _clean_price(data.get('price'))
+        if price == 'invalid':
+            return jsonify({"message": "Price must be a number that is zero or more, with up to two decimal places."}), 400
+
         new_artwork = Artwork(
             organization_id=member.organization_id,
             title=data.get('title'),
@@ -111,7 +130,7 @@ def create_artwork():
             condition=data.get('condition'),
             location=data.get('location'),
             theme=data.get('theme'),
-            price=data.get('price') or None,
+            price=price,
             category=data.get('category'),
             image_path=data.get('image_path'),
             description=data.get('description'),
@@ -164,13 +183,16 @@ def update_artwork(id):
         if 'image_path' in data and not is_valid_image_path(data['image_path'], member.organization_id):
             return jsonify({"message": "Invalid image_path. Upload the image first and use the filename it returns."}), 400
 
+        if 'price' in data:
+            price = _clean_price(data.get('price'))
+            if price == 'invalid':
+                return jsonify({"message": "Price must be a number that is zero or more, with up to two decimal places."}), 400
+            data = {**data, 'price': price}
+
         allowed_fields = ['title', 'artist', 'medium', 'dimensions', 'condition', 'location', 'theme', 'image_path', 'description', 'price', 'category']
         allowed_fields_changed = [key for key in allowed_fields if key in data]
         for key in allowed_fields_changed:
-            value = data[key]
-            if key == 'price' and value == '':
-                value = None
-            setattr(artwork, key, value)
+            setattr(artwork, key, data[key])
         db.session.commit()
         log_activity(artwork.id, member.id, f"updated fields: {', '.join(allowed_fields_changed)}")
         logger.info(f"Artwork updated: '{artwork.title}' (id={id}) by member {member.id}")

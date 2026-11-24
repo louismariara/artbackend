@@ -104,7 +104,7 @@ def resolve_org_from_subdomain():
     subdomain = get_subdomain()
     if not subdomain or subdomain in RESERVED_SUBDOMAINS:
         return None
-    return Organization.query.filter_by(slug=subdomain).first()
+    return apply_lease(Organization.query.filter_by(slug=subdomain).first())
 def resolve_request_org(data=None):
     """Resolve which gallery an unauthenticated request (signup/login) is for.
     The subdomain wins if it resolves to a real org — that's the real
@@ -121,9 +121,42 @@ def resolve_request_org(data=None):
     if data:
         org_slug = data.get('org_slug')
         if org_slug:
-            return Organization.query.filter_by(slug=org_slug).first()
+            return apply_lease(Organization.query.filter_by(slug=org_slug).first())
 
     return None
+def apply_lease(org):
+    """Suspend a gallery the day after the last day it paid for.
+
+    A date of today is still paid. No date means the gallery is not on a
+    lease yet, so it is left alone. A suspension a super admin set by hand
+    stays in place. When a later date is recorded, a lease suspension lifts
+    itself."""
+    if org is None:
+        return None
+    from datetime import date
+    from ..extensions import db
+
+    today = date.today()
+    expired = org.paid_until is not None and org.paid_until < today
+    if expired and org.status == 'active':
+        org.status = 'suspended'
+        org.suspended_reason = 'lease'
+        db.session.commit()
+        logger.info(f"Gallery '{org.name}' auto-suspended: paid through {org.paid_until.isoformat()}")
+        from .notify import notify_all_admins
+        notify_all_admins(
+            f"The lease for {org.name} ended on {org.paid_until.isoformat()}. "
+            "The gallery is suspended until a new paid-through date is recorded.",
+            org.id,
+        )
+    elif not expired and org.status == 'suspended' and org.suspended_reason == 'lease':
+        org.status = 'active'
+        org.suspended_reason = None
+        db.session.commit()
+        logger.info(f"Gallery '{org.name}' reactivated because its lease is current")
+    return org
+
+
 def build_reset_link(org, token):
     """Password-reset link on the member's own gallery address. A gallery slug can
     only contain a-z, 0-9 and hyphens (is_valid_slug), so it is safe to put in a URL."""

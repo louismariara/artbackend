@@ -32,6 +32,9 @@ def tenant_required(fn):
             # Token's org claim doesn't match the member's actual gallery —
             # e.g. a stale token from before a member was moved/removed.
             return jsonify({"message": "Token does not match your account"}), 401
+        if member.organization:
+            from .helpers import apply_lease
+            apply_lease(member.organization)
         if member.organization and member.organization.status != 'active':
             # Gallery suspended by a super admin — block access even on an
             # otherwise-valid, unexpired token.
